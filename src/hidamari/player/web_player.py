@@ -1,33 +1,66 @@
-import sys
+import glob
 import logging
+import os
 import pathlib
+import sys
 
 import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("WebKit2", "4.1")
-from gi.repository import Gtk, WebKit2, Gdk
 
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gdk, Gtk, WebKit2
 from pydbus import SessionBus
 
-try:
-    import os
-    sys.path.insert(1, os.path.join(sys.path[0], '..'))
-    from player.base_player import BasePlayer
-    from menu import build_menu
-    from commons import *
-    from utils import ConfigUtil
-except ModuleNotFoundError:
-    from hidamari.player.base_player import BasePlayer
-    from hidamari.menu import build_menu
-    from hidamari.commons import *
-    from hidamari.utils import ConfigUtil
+from hidamari.commons import (
+    CONFIG_KEY_DATA_SOURCE,
+    CONFIG_KEY_MODE,
+    CONFIG_KEY_MUTE,
+    CONFIG_KEY_VOLUME,
+    DBUS_NAME_PLAYER,
+    LOGGER_NAME,
+    MODE_WEBPAGE,
+)
+from hidamari.menu import build_menu
+from hidamari.player.base_player import BasePlayer
+from hidamari.utils import ConfigUtil
 
 logger = logging.getLogger(LOGGER_NAME)
 
 
+def setup_render_device():
+    """
+    WebKitGTK's DMA-BUF renderer cannot allocate GBM buffers on the NVIDIA
+    driver ("Failed to create GBM buffer: Invalid argument"), which leaves the
+    webpage blank. When an NVIDIA GPU is present, steer WebKit to a Mesa
+    render node instead, or fall back to shared-memory buffers on NVIDIA-only
+    systems. Must be called before the first WebView is created.
+    """
+    overrides = (
+        "WEBKIT_WEB_RENDER_DEVICE_FILE",
+        "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
+        "WEBKIT_DISABLE_DMABUF_RENDERER",
+    )
+    if any(var in os.environ for var in overrides):
+        return
+    drivers = {}
+    for node in sorted(glob.glob("/dev/dri/renderD*")):
+        driver = os.path.realpath(f"/sys/class/drm/{os.path.basename(node)}/device/driver")
+        drivers[node] = os.path.basename(driver)
+    if "nvidia" not in drivers.values():
+        return
+    for node, driver in drivers.items():
+        if driver != "nvidia":
+            logger.info(f"[WebPlayer] Using render device {node} ({driver})")
+            os.environ["WEBKIT_WEB_RENDER_DEVICE_FILE"] = node
+            return
+    logger.info("[WebPlayer] NVIDIA-only system, using SHM buffers for WebKit")
+    os.environ["WEBKIT_DMABUF_RENDERER_FORCE_SHM"] = "1"
+
+
 class WebWindow(Gtk.ApplicationWindow):
     def __init__(self, *args, **kwargs):
-        super(WebWindow, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.__webview = WebKit2.WebView()
         self.add(self.__webview)
         self.__webview.show()
@@ -71,7 +104,7 @@ class WebPlayer(BasePlayer):
     """
 
     def __init__(self, *args, **kwargs):
-        super(WebPlayer, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.config = None
         self.reload_config()
 
@@ -80,7 +113,7 @@ class WebPlayer(BasePlayer):
 
     def do_activate(self):
         super().do_activate()
-        self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]['Default']
+        self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]["Default"]
 
     @property
     def mode(self):
@@ -92,13 +125,16 @@ class WebPlayer(BasePlayer):
 
     @data_source.setter
     def data_source(self, data_source: str):
-        self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = data_source
+        self.config[CONFIG_KEY_DATA_SOURCE]["Default"] = data_source
         if self.mode != MODE_WEBPAGE:
             raise ValueError("Invalid mode")
 
         # Convert to uri if necessary
-        if not data_source.startswith("http://") and \
-                not data_source.startswith("https://") and not data_source.startswith("file://"):
+        if (
+            not data_source.startswith("http://")
+            and not data_source.startswith("https://")
+            and not data_source.startswith("file://")
+        ):
             data_source = pathlib.Path(data_source).resolve().as_uri()
 
         for monitor, window in self.windows.items():
@@ -143,6 +179,7 @@ class WebPlayer(BasePlayer):
 
 
 def main():
+    setup_render_device()
     bus = SessionBus()
     app = WebPlayer()
     try:
