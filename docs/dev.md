@@ -58,15 +58,31 @@ Note 1: Packages may have different names among distros. Hint: [pkgs.org](https:
 
 Note 2: Please don't worry about the `gnome-desktop` package; it's just a library, not the GNOME Desktop Environment.
 
+Note 3: **VLC / libVLC is required for video wallpapers.** The Flatpak bundled it;
+a local install needs the system packages (`vlc` / `libvlc5`). Without them the
+player process crashes with `no function 'libvlc_new'`.
+
 - Ubuntu:
 ```bash
-sudo apt install dconf-cli libappindicator3-1 libgnome-desktop-4-1 libwebkit2gtk-4.1-0 libwnck-3-0 mesa-utils vdpauinfo xdg-user-dirs
+sudo apt install dconf-cli libappindicator3-1 libadwaita-1-0 libgnome-desktop-4-1 \
+  libgtk-4-1 libwebkitgtk-6.0-4 mesa-utils vdpauinfo xdg-user-dirs \
+  gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-webkit-6.0 \
+  gir1.2-appindicator3-0.1 gir1.2-gnomedesktop-4.0 \
+  vlc libvlc5 vlc-plugin-base ffmpeg
 ```
 
 - Fedora:
 ```bash
-sudo dnf install dconf glx-utils gnome-desktop4 libappindicator-gtk3 libwnck3 vdpauinfo webkit2gtk4.1 xdg-user-dirs
+sudo dnf install dconf glx-utils gnome-desktop4 libadwaita libappindicator-gtk3 \
+  vdpauinfo webkitgtk6.0 xdg-user-dirs \
+  python3-gobject gtk4 vlc vlc-core ffmpeg
 ```
+
+> The control panel and wallpaper players use **GTK 4 + libadwaita** (and
+> follow the system light/dark preference automatically). Maximized-window
+> detection uses EWMH via libX11 (no libwnck). The system-tray process still
+> uses **GTK 3 + AppIndicator** and is launched in a separate process so the
+> two GTK major versions never share an interpreter.
 
 #### Build dependencies
 - Ubuntu:
