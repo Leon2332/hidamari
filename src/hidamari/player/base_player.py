@@ -6,8 +6,8 @@ from abc import abstractmethod
 import gi
 import setproctitle
 
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, Gtk
 from pydbus import SessionBus
 
@@ -42,61 +42,83 @@ class BasePlayer(Gtk.Application):
 
     def __init__(self, *args, **kwargs):
         super().__init__(
-            *args, application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE, **kwargs
+            *args,
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+            **kwargs,
         )
         setproctitle.setproctitle(mp.current_process().name)
         self.windows = dict()
+        self._monitor_signal_ids = []
         self._monitor_detect()
 
     def _monitor_detect(self):
         display = Gdk.Display.get_default()
-        screen = display.get_default_screen()
+        monitors = display.get_monitors()
 
-        for i in range(display.get_n_monitors()):
-            monitor = display.get_monitor(i)
+        for i in range(monitors.get_n_items()):
+            monitor = monitors.get_item(i)
             if monitor not in self.windows:
                 self.windows[monitor] = None
+            handler_id = monitor.connect("notify::geometry", self._on_geometry_changed)
+            self._monitor_signal_ids.append((monitor, handler_id))
 
-        screen.connect("size-changed", self._on_size_changed)
-        display.connect("monitor-added", self._on_monitor_added)
-        display.connect("monitor-removed", self._on_monitor_removed)
+        monitors.connect("items-changed", self._on_monitors_changed)
 
     def new_window(self, gdk_monitor):
         # Override here for different window
         # NOTE: Don't forget to set the application=self, otherwise the application will quit immediately lol
         return DummyWindow(application=self)
 
-    def _on_size_changed(self, *args):
-        logger.info("[Player] size-changed")
-        for monitor in self.windows:
-            rect = monitor.get_geometry()
-            x, y, width, height = rect.x, rect.y, rect.width, rect.height
-            monitor.win_resize(width, height)
-            monitor.win_move(x, y)
+    def _on_geometry_changed(self, monitor, *_args):
+        logger.info("[Player] geometry-changed")
+        window = self.windows.get(monitor)
+        if window is None:
+            return
+        rect = monitor.get_geometry()
+        if hasattr(window, "resize_to"):
+            # Pure X11 surfaces take absolute position + size.
+            try:
+                window.resize_to(rect.width, rect.height, rect.x, rect.y)
+            except TypeError:
+                window.resize_to(rect.width, rect.height)
+        elif hasattr(window, "width"):
+            window.width = rect.width
+            window.height = rect.height
 
-    def _on_monitor_added(self, _, gdk_monitor, *args):
-        logger.info("[Player] monitor-added")
-        self.windows[gdk_monitor] = None
+    def _on_monitors_changed(self, model, position, removed, added):
+        logger.info("[Player] monitors-changed (pos=%s removed=%s added=%s)", position, removed, added)
+        # Rebuild the monitor map from the live list model.
+        current = set()
+        for i in range(model.get_n_items()):
+            monitor = model.get_item(i)
+            current.add(monitor)
+            if monitor not in self.windows:
+                self.windows[monitor] = None
+                handler_id = monitor.connect("notify::geometry", self._on_geometry_changed)
+                self._monitor_signal_ids.append((monitor, handler_id))
+
+        for monitor in list(self.windows.keys()):
+            if monitor not in current:
+                window = self.windows.pop(monitor)
+                if window is not None:
+                    window.destroy()
+
         self.do_activate()
-
-    def _on_monitor_removed(self, _, gdk_monitor, *args):
-        logger.info("[Player] monitor-removed")
-        del self.windows[gdk_monitor]
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
 
     def do_activate(self):
-        for monitor in self.windows:
+        for monitor in list(self.windows.keys()):
             if not self.windows[monitor]:
                 window = self.new_window(monitor)
-                window.set_type_hint(Gdk.WindowTypeHint.DESKTOP)
-                rect = monitor.get_geometry()
-                x, y, width, height = rect.x, rect.y, rect.width, rect.height
-                window.set_size_request(width, height)
-                window.move(x, y)
                 self.windows[monitor] = window
-            self.windows[monitor].present()
+            win = self.windows[monitor]
+            if hasattr(win, "present"):
+                win.present()
+            elif hasattr(win, "show"):
+                win.show()
         # Workaround for DING extension
         gnome_desktop_icon_workaround()
 
