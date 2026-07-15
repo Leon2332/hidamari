@@ -27,12 +27,12 @@ from hidamari.commons import (
     MODE_VIDEO,
     MODE_WEBPAGE,
 )
-from hidamari.gui.control import main as gui_main
-from hidamari.menu import show_systray_icon
 from hidamari.monitor import Monitors
-from hidamari.player.video_player import main as video_player_main
-from hidamari.player.web_player import main as web_player_main
 from hidamari.utils import ConfigUtil, EndSessionHandler, get_video_paths
+
+# NOTE: GUI (GTK4/libadwaita), video/web players (GTK4), and the system tray
+# (GTK3 + AppIndicator) must not import into the same process. Launch each via
+# multiprocessing targets that import their stack lazily.
 
 loop = GLib.MainLoop()
 logger = logging.getLogger(LOGGER_NAME)
@@ -127,26 +127,29 @@ class HidamariServer:
             self.config[CONFIG_KEY_DATA_SOURCE][monitor] = data_source
         self.config[CONFIG_KEY_DATA_SOURCE]["Default"] = data_source  # always update default source
 
-        # Quit current then create a new player
+        # Quit current then create a new player. Keep this path fast so the
+        # GUI D-Bus call to video()/stream()/webpage() does not freeze the UI.
         self._quit_player()
 
-        # Terminate old player process and wait for it to finish
+        # Terminate old player process and wait briefly
         if self.player_process:
             self.player_process.terminate()
-            self.player_process.join(timeout=5)  # Wait up to 5 seconds
+            self.player_process.join(timeout=1.5)
             if self.player_process.is_alive():
                 logger.warning("[Server] Player process didn't terminate, killing it")
                 self.player_process.kill()
-                self.player_process.join(timeout=2)
+                self.player_process.join(timeout=0.5)
             self.player_process = None
 
         if mode in [MODE_VIDEO, MODE_STREAM]:
             self.player_process = Process(
-                name=f"hidamari-player-{self._player_count}", target=video_player_main
+                name=f"hidamari-player-{self._player_count}",
+                target=_run_video_player,
             )
         elif mode == MODE_WEBPAGE:
             self.player_process = Process(
-                name=f"hidamari-player-{self._player_count}", target=web_player_main
+                name=f"hidamari-player-{self._player_count}",
+                target=_run_web_player,
             )
         elif mode == MODE_NULL:
             pass
@@ -167,7 +170,7 @@ class HidamariServer:
                         self.sys_icon_process.join(timeout=1)
                 self.sys_icon_process = Process(
                     name="hidamari-systray",
-                    target=show_systray_icon,
+                    target=_run_systray,
                     args=(mode, self.localedir),
                 )
                 self.sys_icon_process.start()
@@ -175,10 +178,17 @@ class HidamariServer:
 
     @staticmethod
     def _quit_player():
-        """Quit current player"""
+        """Ask the current player to quit. Never raise — caller must keep going."""
         player = get_instance(DBUS_NAME_PLAYER)
-        if player:
-            player.quit_player()
+        if not player:
+            return
+        try:
+            # Short timeout so a dead/hung player cannot freeze Apply for ~25s.
+            player.quit_player(timeout=1)
+        except GLib.Error as e:
+            logger.warning("[Server] quit_player (ignored): %s", e)
+        except Exception as e:
+            logger.warning("[Server] quit_player unexpected (ignored): %s", e)
 
     def video(self, video_path=None, monitor=None):
         self._setup_player(MODE_VIDEO, video_path, monitor)
@@ -232,7 +242,7 @@ class HidamariServer:
         """Show main GUI"""
         self.gui_process = Process(
             name="hidamari-gui",
-            target=gui_main,
+            target=_run_gui,
             args=(
                 self.version,
                 self.pkgdatadir,
@@ -358,6 +368,30 @@ def get_instance(dbus_name):
     except GLib.Error:
         return None
     return instance
+
+
+def _run_gui(version, pkgdatadir, localedir):
+    from hidamari.gui.control import main as gui_main
+
+    gui_main(version, pkgdatadir, localedir)
+
+
+def _run_video_player():
+    from hidamari.player.video_player import main as video_player_main
+
+    video_player_main()
+
+
+def _run_web_player():
+    from hidamari.player.web_player import main as web_player_main
+
+    web_player_main()
+
+
+def _run_systray(mode, localedir):
+    from hidamari.menu import show_systray_icon
+
+    show_systray_icon(mode, localedir)
 
 
 def main(version, pkgdatadir, localedir, args):
