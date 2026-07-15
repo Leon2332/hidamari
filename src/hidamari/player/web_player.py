@@ -6,10 +6,10 @@ import sys
 
 import gi
 
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-gi.require_version("WebKit2", "4.1")
-from gi.repository import Gdk, Gtk, WebKit2
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("WebKit", "6.0")
+from gi.repository import Gdk, Gtk, WebKit
 from pydbus import SessionBus
 
 from hidamari.commons import (
@@ -21,8 +21,9 @@ from hidamari.commons import (
     LOGGER_NAME,
     MODE_WEBPAGE,
 )
-from hidamari.menu import build_menu
+from hidamari.menu import build_menu, popup_menu_at
 from hidamari.player.base_player import BasePlayer
+from hidamari.player.x11_window import is_primary_monitor
 from hidamari.utils import ConfigUtil
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -61,12 +62,16 @@ def setup_render_device():
 class WebWindow(Gtk.ApplicationWindow):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__webview = WebKit2.WebView()
-        self.add(self.__webview)
-        self.__webview.show()
+        self.__webview = WebKit.WebView()
+        self.set_child(self.__webview)
 
         self.menu = None
-        self.__webview.connect("button-press-event", self._on_button_press_event)
+        # Capture right-clicks before WebKit consumes them when possible.
+        gesture = Gtk.GestureClick.new()
+        gesture.set_button(Gdk.BUTTON_SECONDARY)
+        gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        gesture.connect("pressed", self._on_right_click)
+        self.__webview.add_controller(gesture)
 
     def load_uri(self, uri):
         self.__webview.load_uri(uri)
@@ -77,13 +82,11 @@ class WebWindow(Gtk.ApplicationWindow):
     def reload(self):
         self.__webview.reload()
 
-    def _on_button_press_event(self, widget, event):
-        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
-            if not self.menu:
-                self.menu = build_menu(MODE_WEBPAGE)
-            self.menu.popup_at_pointer()
-            return True
-        return False
+    def _on_right_click(self, _gesture, _n_press, x, y):
+        if not self.menu:
+            self.menu = build_menu(MODE_WEBPAGE, self)
+        popup_menu_at(self.menu, self, x, y)
+        return True
 
 
 class WebPlayer(BasePlayer):
@@ -139,7 +142,7 @@ class WebPlayer(BasePlayer):
 
         for monitor, window in self.windows.items():
             window.load_uri(data_source)
-            if not monitor.is_primary():
+            if not is_primary_monitor(monitor):
                 window.set_is_mute(True)
         self.volume = self.config[CONFIG_KEY_VOLUME]
         self.is_mute = self.config[CONFIG_KEY_MUTE]
@@ -161,7 +164,7 @@ class WebPlayer(BasePlayer):
     def is_mute(self, is_mute):
         self.config[CONFIG_KEY_MUTE] = is_mute
         for monitor, window in self.windows.items():
-            if monitor.is_primary():
+            if is_primary_monitor(monitor):
                 window.set_is_mute(is_mute)
 
     @property
