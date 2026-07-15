@@ -5,11 +5,8 @@ import logging
 import os
 from pprint import pformat
 
-import gi
-
-gi.require_version("Wnck", "3.0")
 import pydbus
-from gi.repository import Gio, GLib, Wnck
+from gi.repository import Gio, GLib
 
 from hidamari.commons import (
     AUTOSTART_DESKTOP_CONTENT,
@@ -83,6 +80,8 @@ def setup_autostart(autostart):
         https://libportal.org/method.Portal.request_background.html
         https://libportal.org/method.Portal.request_background_finish.html
         """
+
+        import gi
 
         gi.require_version("Xdp", "1.0")
         from gi.repository import Xdp
@@ -271,94 +270,179 @@ class EndSessionHandler:
 
 class WindowHandler:
     """
-    Handler for monitoring window events (maximized and fullscreen mode) for X11
+    Handler for monitoring maximized/fullscreen windows on X11 via EWMH.
+
+    Implemented with libX11 (ctypes) instead of libwnck so it works inside
+    GTK4 processes without pulling Gtk 3.0. Polls every 500ms.
     """
 
+    _POLL_MS = 500
+
     def __init__(self, on_window_state_changed: callable):
+        import ctypes
+        from ctypes import POINTER, byref, c_char_p, c_int, c_ulong, c_void_p
+
         self.on_window_state_changed = on_window_state_changed
-        self.screen = Wnck.Screen.get_default()
-        self.screen.force_update()
-
-        # Store signal handler IDs for cleanup
-        self.signal_handlers = []
-        self.window_signal_handlers = {}
-
-        # Connect screen signals and store handler IDs
-        handler_id = self.screen.connect("window-opened", self.window_opened, None)
-        self.signal_handlers.append((self.screen, handler_id))
-
-        handler_id = self.screen.connect("window-closed", self.eval, None)
-        self.signal_handlers.append((self.screen, handler_id))
-
-        handler_id = self.screen.connect("active-workspace-changed", self.eval, None)
-        self.signal_handlers.append((self.screen, handler_id))
-
-        # Connect to existing windows
-        for window in self.screen.get_windows():
-            self._connect_window(window)
-
         self.prev_state = None
-        # Initial check
+        self._source_id = None
+        self._ctypes = ctypes
+        self._byref = byref
+        self._c_ulong = c_ulong
+        self._c_int = c_int
+        self._c_void_p = c_void_p
+        self._c_char_p = c_char_p
+        self._POINTER = POINTER
+
+        try:
+            self._x11 = ctypes.CDLL("libX11.so.6")
+        except OSError:
+            try:
+                self._x11 = ctypes.CDLL("libX11.so")
+            except OSError as e:
+                logger.error("[WindowHandler] libX11 unavailable: %s", e)
+                self._x11 = None
+                return
+
+        x11 = self._x11
+        x11.XOpenDisplay.restype = c_void_p
+        x11.XOpenDisplay.argtypes = [c_char_p]
+        x11.XDefaultRootWindow.restype = c_ulong
+        x11.XDefaultRootWindow.argtypes = [c_void_p]
+        x11.XInternAtom.restype = c_ulong
+        x11.XInternAtom.argtypes = [c_void_p, c_char_p, c_int]
+        x11.XGetWindowProperty.restype = c_int
+        x11.XGetWindowProperty.argtypes = [
+            c_void_p,
+            c_ulong,
+            c_ulong,
+            ctypes.c_long,
+            ctypes.c_long,
+            c_int,
+            c_ulong,
+            POINTER(c_ulong),
+            POINTER(c_int),
+            POINTER(c_ulong),
+            POINTER(c_ulong),
+            POINTER(c_void_p),
+        ]
+        x11.XFree.argtypes = [c_void_p]
+        x11.XCloseDisplay.argtypes = [c_void_p]
+
+        self._display = x11.XOpenDisplay(None)
+        if not self._display:
+            logger.error("[WindowHandler] XOpenDisplay failed")
+            self._x11 = None
+            return
+
+        self._root = x11.XDefaultRootWindow(self._display)
+        self._XA_ATOM = 4
+        self._AnyPropertyType = 0
+        self._atom_client_list = x11.XInternAtom(self._display, b"_NET_CLIENT_LIST", False)
+        self._atom_wm_state = x11.XInternAtom(self._display, b"_NET_WM_STATE", False)
+        self._atom_max_horz = x11.XInternAtom(
+            self._display, b"_NET_WM_STATE_MAXIMIZED_HORZ", False
+        )
+        self._atom_max_vert = x11.XInternAtom(
+            self._display, b"_NET_WM_STATE_MAXIMIZED_VERT", False
+        )
+        self._atom_fullscreen = x11.XInternAtom(
+            self._display, b"_NET_WM_STATE_FULLSCREEN", False
+        )
+        self._atom_hidden = x11.XInternAtom(self._display, b"_NET_WM_STATE_HIDDEN", False)
+        self._atom_skip_taskbar = x11.XInternAtom(
+            self._display, b"_NET_WM_STATE_SKIP_TASKBAR", False
+        )
+        self._atom_skip_pager = x11.XInternAtom(
+            self._display, b"_NET_WM_STATE_SKIP_PAGER", False
+        )
+
         self.eval()
+        self._source_id = GLib.timeout_add(self._POLL_MS, self._poll)
 
-    def _connect_window(self, window):
-        """Connect to a window and store the handler ID"""
-        if window not in self.window_signal_handlers:
-            handler_id = window.connect("state-changed", self.eval, None)
-            self.window_signal_handlers[window] = handler_id
+    def _get_atom_list(self, window, atom):
+        x11 = self._x11
+        actual_type = self._c_ulong()
+        actual_format = self._c_int()
+        nitems = self._c_ulong()
+        bytes_after = self._c_ulong()
+        prop = self._c_void_p()
+        status = x11.XGetWindowProperty(
+            self._display,
+            self._c_ulong(window),
+            self._c_ulong(atom),
+            0,
+            1024,
+            False,
+            self._AnyPropertyType,
+            self._byref(actual_type),
+            self._byref(actual_format),
+            self._byref(nitems),
+            self._byref(bytes_after),
+            self._byref(prop),
+        )
+        if status != 0 or not prop.value or nitems.value == 0:
+            if prop.value:
+                x11.XFree(prop)
+            return []
+        # 32-bit values on X11 property format
+        arr_type = self._c_ulong * nitems.value
+        values = list(arr_type.from_address(prop.value))
+        x11.XFree(prop)
+        return values
 
-    def window_opened(self, screen, window, _):
-        self._connect_window(window)
+    def _poll(self):
+        self.eval()
+        return True  # keep the timeout alive
 
     def eval(self, *args):
-        # TODO: #28 (Wallpaper stops animating on other monitor when app maximized on other)
-        is_changed = False
+        if self._x11 is None or not getattr(self, "_display", None):
+            return
 
+        # TODO: #28 (Wallpaper stops animating on other monitor when app maximized on other)
         is_any_maximized, is_any_fullscreen = False, False
-        for window in self.screen.get_windows():
-            base_state = not Wnck.Window.is_minimized(window) and Wnck.Window.is_on_workspace(
-                window, self.screen.get_active_workspace()
-            )
-            is_maximized = Wnck.Window.is_maximized(window) and base_state
-            is_fullscreen = Wnck.Window.is_fullscreen(window) and base_state
-            if is_maximized is True:
-                is_any_maximized = True
-            if is_fullscreen is True:
-                is_any_fullscreen = True
+        try:
+            clients = self._get_atom_list(self._root, self._atom_client_list)
+            for win in clients:
+                states = set(self._get_atom_list(win, self._atom_wm_state))
+                if self._atom_hidden in states:
+                    continue
+                # Skip desktop/dock-like surfaces
+                if self._atom_skip_taskbar in states and self._atom_skip_pager in states:
+                    continue
+                if self._atom_fullscreen in states:
+                    is_any_fullscreen = True
+                if self._atom_max_horz in states and self._atom_max_vert in states:
+                    is_any_maximized = True
+                if is_any_maximized and is_any_fullscreen:
+                    break
+        except Exception as e:
+            logger.warning("[WindowHandler] EWMH poll failed: %s", e)
+            return
 
         cur_state = {"is_any_maximized": is_any_maximized, "is_any_fullscreen": is_any_fullscreen}
         if self.prev_state is None or self.prev_state != cur_state:
-            is_changed = True
             self.prev_state = cur_state
-
-        if is_changed:
-            self.on_window_state_changed(
-                {"is_any_maximized": is_any_maximized, "is_any_fullscreen": is_any_fullscreen}
-            )
+            self.on_window_state_changed(cur_state)
             logger.debug(f"[WindowHandler] {cur_state}")
 
     def cleanup(self):
-        """Cleanup all signal handlers to prevent memory leaks"""
-        # Disconnect screen signals
-        for obj, handler_id in self.signal_handlers:
+        if self._source_id is not None:
+            GLib.source_remove(self._source_id)
+            self._source_id = None
+        if getattr(self, "_display", None) and self._x11 is not None:
             try:
-                obj.disconnect(handler_id)
+                self._x11.XCloseDisplay(self._display)
             except Exception as e:
-                logger.warning(f"[WindowHandler] Error disconnecting screen signal: {e}")
-        self.signal_handlers.clear()
-
-        # Disconnect window signals
-        for window, handler_id in self.window_signal_handlers.items():
-            try:
-                window.disconnect(handler_id)
-            except Exception as e:
-                logger.warning(f"[WindowHandler] Error disconnecting window signal: {e}")
-        self.window_signal_handlers.clear()
+                logger.warning("[WindowHandler] XCloseDisplay error: %s", e)
+            self._display = None
 
 
 class ConfigUtil:
     def generate_template(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
+        from hidamari.commons import refresh_config_template_monitors
+
+        refresh_config_template_monitors()
         self.save(CONFIG_TEMPLATE)
 
     @staticmethod
@@ -426,6 +510,10 @@ class ConfigUtil:
                     break
 
     def load(self):
+        from hidamari.commons import refresh_config_template_monitors
+
+        # Ensure template monitor keys match the current layout (Gdk 4).
+        refresh_config_template_monitors()
         if os.path.isfile(CONFIG_PATH):
             with open(CONFIG_PATH) as f:
                 json_str = f.read()
