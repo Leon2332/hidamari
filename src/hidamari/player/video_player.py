@@ -11,10 +11,10 @@ from threading import Timer
 
 import gi
 
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 import vlc
-from gi.repository import Gdk, Gio, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk
 from PIL import Image, ImageFilter
 from pydbus import SessionBus
 
@@ -34,8 +34,9 @@ from hidamari.commons import (
     MODE_STREAM,
     MODE_VIDEO,
 )
-from hidamari.menu import build_menu
 from hidamari.player.base_player import BasePlayer
+from hidamari.player.x11_surface import X11DesktopSurface
+from hidamari.player.x11_window import is_primary_monitor
 from hidamari.utils import (
     ActiveHandler,
     ConfigUtil,
@@ -51,6 +52,9 @@ if is_wayland():
     # TODO: Window event monitoring for GNOME Wayland is broken
     class WindowHandler:
         def __init__(self, _: callable):
+            pass
+
+        def cleanup(self):
             pass
 else:
     from hidamari.utils import WindowHandler
@@ -105,79 +109,72 @@ class Fade:
             self.timer = None
 
 
-class VLCWidget(Gtk.DrawingArea):
+class PlayerWindow:
     """
-    Simple VLC widget.
-    Its player can be controlled through the 'player' attribute, which
-    is a vlc.MediaPlayer() instance.
+    Wallpaper surface: pure X11 desktop window (depth 24) + libVLC embed.
+
+    Not a Gtk window — GTK4's 32-bit ARGB surfaces cause white/glitched video
+    with xcb_x11 under GNOME XWayland. The Gtk.Application still owns the
+    process main loop via BasePlayer.hold().
     """
 
-    __gtype_name__ = "VLCWidget"
-
-    def __init__(self, width, height):
-        Gtk.DrawingArea.__init__(self)
-
-        # Spawn a VLC instance and create a new media player to embed.
-        # Some options need to be specified when instantiating VLC.
-        # --no-disable-screensaver: Allow screensaver.
-        # --aout=pulse: Force PulseAudio output. VLC's PipeWire audio-output
-        #   plugin segfaults (pw_thread_loop_lock) when multiple instances are
-        #   active, e.g. one per monitor. See the Flatpak, which uses Pulse too.
-        vlc_options = ["--no-disable-screensaver", "--aout=pulse"]
-        self.instance = vlc.Instance(vlc_options)
-        self.player = self.instance.media_player_new()
-
-        def handle_embed(*args):
-            self.player.set_xwindow(self.get_window().get_xid())
-            return True
-
-        # Embed and set size.
-        self.connect("realize", handle_embed)
-        self.set_size_request(width, height)
-
-    def cleanup(self):
-        """Cleanup VLC resources to prevent memory leaks"""
-        try:
-            if self.player:
-                self.player.stop()
-                self.player.release()
-                self.player = None
-            if self.instance:
-                self.instance.release()
-                self.instance = None
-        except Exception as e:
-            logger.warning(f"[VLCWidget] Cleanup error: {e}")
-
-
-class PlayerWindow(Gtk.ApplicationWindow):
-    def __init__(self, name, width, height, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Setup a VLC widget given the provided width and height.
+    def __init__(self, name, x, y, width, height):
         self.width = width
         self.height = height
         self.name = name
-        self.__vlc_widget = VLCWidget(width, height)
-        self.add(self.__vlc_widget)
-        self.__vlc_widget.show()
-
-        # These are to allow us to right click. VLC can't hijack mouse input, and probably not key inputs either in
-        # Case we want to add keyboard shortcuts later on.
-        self.__vlc_widget.player.video_set_mouse_input(False)
-        self.__vlc_widget.player.video_set_key_input(False)
-
-        # A timer that handling fade-in/out
+        self.surface = X11DesktopSurface(name, x, y, width, height)
         self.fade = Fade()
 
-        self.menu = None
-        self.connect("button-press-event", self._on_button_press_event)
+        vlc_options = [
+            "--no-disable-screensaver",
+            "--aout=pulse",
+            "--no-video-title-show",
+            # Software path: GL/VAAPI into XWayland wallpaper surfaces goes white
+            # or RGB-scrambles when other windows move (Mutter compositing).
+            "--avcodec-hw=none",
+            "--vout=xcb_x11",
+            "--no-video-deco",
+        ]
+        try:
+            self.instance = vlc.Instance(vlc_options)
+        except (NameError, OSError, AttributeError) as e:
+            raise RuntimeError(
+                "libVLC is not available. Install VLC packages, e.g. "
+                "`sudo apt install vlc` (provides libvlc5 + plugins), "
+                "then restart Hidamari."
+            ) from e
+        if self.instance is None:
+            raise RuntimeError(
+                "Failed to create a VLC instance. Install VLC (`sudo apt install vlc`) "
+                "and ensure libvlc is on the library path."
+            )
+        self.player = self.instance.media_player_new()
+        self.player.video_set_mouse_input(False)
+        self.player.video_set_key_input(False)
+
+        xid = self.surface.get_xid()
+        if xid is None:
+            raise RuntimeError("Wallpaper X11 surface has no XID")
+        self.player.set_xwindow(int(xid))
+        logger.info("[PlayerWindow] VLC embedded into pure X11 xid=%s", xid)
+
+    def present(self):
+        self.surface.present()
+
+    def show(self):
+        self.surface.show()
 
     def play(self):
-        self.__vlc_widget.player.play()
+        xid = self.surface.get_xid()
+        if xid is not None:
+            self.player.set_xwindow(int(xid))
+        self.player.play()
 
     def play_fade(self, target, fade_duration_sec, fade_interval):
         self.play()
         cur = 0
-        step = (target - cur) / (fade_duration_sec / fade_interval)
+        steps = max(1.0, float(fade_duration_sec) / max(float(fade_interval), 0.01))
+        step = (target - cur) / steps
         self.fade.cancel()
         self.fade.start(
             cur=cur,
@@ -188,16 +185,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def is_playing(self):
-        return self.__vlc_widget.player.is_playing()
+        return self.player.is_playing()
 
     def pause(self):
         if self.is_playing():
-            self.__vlc_widget.player.pause()
+            self.player.pause()
 
     def pause_fade(self, fade_duration_sec, fade_interval):
         cur = self.get_volume()
         target = 0
-        step = (target - cur) / (fade_duration_sec / fade_interval)
+        steps = max(1.0, float(fade_duration_sec) / max(float(fade_interval), 0.01))
+        step = (target - cur) / steps
         self.fade.cancel()
         self.fade.start(
             cur=cur,
@@ -210,7 +208,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def volume_fade(self, target, fade_duration_sec, fade_interval):
         cur = self.get_volume()
-        step = (target - cur) / (fade_duration_sec / fade_interval)
+        steps = max(1.0, float(fade_duration_sec) / max(float(fade_interval), 0.01))
+        step = (target - cur) / steps
         self.fade.cancel()
         self.fade.start(
             cur=cur,
@@ -221,33 +220,32 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def media_new(self, *args):
-        return self.__vlc_widget.instance.media_new(*args)
+        return self.instance.media_new(*args)
 
     def set_media(self, *args):
-        self.__vlc_widget.player.set_media(*args)
+        self.player.set_media(*args)
 
     def set_volume(self, *args):
-        self.__vlc_widget.player.audio_set_volume(*args)
+        self.player.audio_set_volume(*args)
 
     def get_volume(self):
-        return self.__vlc_widget.player.audio_get_volume()
+        return self.player.audio_get_volume()
 
     def set_mute(self, is_mute):
-        return self.__vlc_widget.player.audio_set_mute(is_mute)
+        return self.player.audio_set_mute(is_mute)
 
     def get_position(self):
-        return self.__vlc_widget.player.get_position()
+        return self.player.get_position()
 
     def set_position(self, *args):
-        self.__vlc_widget.player.set_position(*args)
+        self.player.set_position(*args)
 
     def snapshot(self, *args):
-        return self.__vlc_widget.player.video_take_snapshot(*args)
+        return self.player.video_take_snapshot(*args)
 
     def centercrop(self, video_width=None, video_height=None):
-        # Getting dimension from libvlc is not reliable enough (need to consider timing)
         if (video_width, video_height) == (None, None):
-            video_width, video_height = self.__vlc_widget.player.video_get_size()
+            video_width, video_height = self.player.video_get_size()
             if video_width == 0 or video_height == 0:
                 logger.warning("[CenterCrop] video_get_size is not ready yet")
                 return
@@ -257,45 +255,52 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if window_ratio == video_ratio:
             return
         elif video_ratio < window_ratio:
-            # If window is wider than video
-            # For example video ratio (4:3)=1.33..., window ratio (16:9)=1.77...
             crop_height = video_width / window_ratio
             top_offset = (video_height - crop_height) / 2
             crop_geometry = (
                 f"{int(video_width)}x{int(crop_height + top_offset)}+0+{int(top_offset)}"
             )
-
         else:
-            # If video is wider than window
             crop_width = video_height * window_ratio
             left_offset = (video_width - crop_width) / 2
             crop_geometry = (
                 f"{int(crop_width + left_offset)}x{int(video_height)}+{int(left_offset)}+0"
             )
-
-        # Crop geometry WxH+L+T: Width x Height + Left Offset + top Offset
         logger.debug(f"[CenterCrop] Crop geometry: {crop_geometry}")
-        self.__vlc_widget.player.video_set_crop_geometry(crop_geometry)
+        self.player.video_set_crop_geometry(crop_geometry)
 
     def add_audio_track(self, audio):
-        self.__vlc_widget.player.add_slave(vlc.MediaSlaveType(1), audio, True)
-
-    def _on_button_press_event(self, widget, event):
-        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
-            if not self.menu:
-                self.menu = build_menu(MODE_VIDEO)
-            self.menu.popup_at_pointer()
-            return True
-        return False
+        self.player.add_slave(vlc.MediaSlaveType(1), audio, True)
 
     def get_name(self):
         return self.name
 
+    def resize_to(self, width, height, x=None, y=None):
+        self.width = width
+        self.height = height
+        self.surface.resize_to(width, height, x, y)
+        xid = self.surface.get_xid()
+        if xid is not None:
+            self.player.set_xwindow(int(xid))
+
+    def destroy(self):
+        self.cleanup()
+
     def cleanup(self):
-        """Cleanup resources to prevent memory leaks"""
         self.fade.cancel()
-        if self.__vlc_widget:
-            self.__vlc_widget.cleanup()
+        try:
+            if self.player:
+                self.player.stop()
+                self.player.release()
+                self.player = None
+            if self.instance:
+                self.instance.release()
+                self.instance = None
+        except Exception as e:
+            logger.warning("[PlayerWindow] VLC cleanup: %s", e)
+        if self.surface:
+            self.surface.destroy()
+            self.surface = None
 
 
 class VideoPlayer(BasePlayer):
@@ -364,14 +369,43 @@ class VideoPlayer(BasePlayer):
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
-        return PlayerWindow(gdk_monitor.get_model(), rect.width, rect.height, application=self)
+        model = gdk_monitor.get_model() or "monitor"
+        return PlayerWindow(model, rect.x, rect.y, rect.width, rect.height)
 
     def do_activate(self):
-        super().do_activate()
-        self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]
+        try:
+            # Keep Gtk.Application alive without any Gtk windows.
+            self.hold()
+            super().do_activate()
+            # Periodically re-lower wallpaper under newly mapped clients.
+            GLib.timeout_add_seconds(2, self._keep_wallpaper_below)
+            GLib.timeout_add(150, self._start_media)
+        except RuntimeError as e:
+            logger.error("[VideoPlayer] %s", e)
+            GLib.idle_add(self.quit)
+            return
 
-    def _on_monitor_added(self, _, gdk_monitor, *args):
-        super()._on_monitor_added(_, gdk_monitor, *args)
+    def _keep_wallpaper_below(self):
+        for window in self.windows.values():
+            if window is not None and getattr(window, "surface", None) is not None:
+                try:
+                    window.surface.restack()
+                except Exception:
+                    pass
+        return True  # repeat
+
+    def _start_media(self):
+        try:
+            self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]
+        except RuntimeError as e:
+            logger.error("[VideoPlayer] %s", e)
+            GLib.idle_add(self.quit)
+        except Exception as e:
+            logger.exception("[VideoPlayer] Failed to start media: %s", e)
+        return False
+
+    def _on_monitors_changed(self, model, position, removed, added):
+        super()._on_monitors_changed(model, position, removed, added)
         self.monitor_sync()
 
     def _on_active_changed(self, active):
@@ -399,7 +433,7 @@ class VideoPlayer(BasePlayer):
                 self.pause_playback()
         elif self.config[CONFIG_KEY_MUTE_WHEN_MAXIMIZED]:
             for monitor, window in self.windows.items():
-                if not monitor.is_primary():
+                if not is_primary_monitor(monitor):
                     continue
                 if self.is_any_fullscreen or self.is_any_maximized:
                     window.volume_fade(
@@ -483,7 +517,7 @@ class VideoPlayer(BasePlayer):
                 """
                 media.add_option("input-repeat=65535")
                 # Prevent awful ear-rape with multiple instances.
-                if not monitor.is_primary():
+                if not is_primary_monitor(monitor):
                     media.add_option("no-audio")
                 window.set_media(media)
                 window.set_position(0.0)
@@ -510,7 +544,7 @@ class VideoPlayer(BasePlayer):
                 media = window.media_new(video_url)
                 media.add_option("input-repeat=65535")
                 window.set_media(media)
-                if monitor.is_primary():
+                if is_primary_monitor(monitor):
                     window.add_audio_track(audio_url)
                 else:
                     # `get_optimal_video` now might return video with audio.
@@ -544,7 +578,7 @@ class VideoPlayer(BasePlayer):
     def volume(self, volume):
         self.config[CONFIG_KEY_VOLUME] = volume
         for monitor in self.windows:
-            if monitor.is_primary():
+            if is_primary_monitor(monitor):
                 self.windows[monitor].set_volume(volume)
 
     @property
@@ -555,7 +589,7 @@ class VideoPlayer(BasePlayer):
     def is_mute(self, is_mute):
         self.config[CONFIG_KEY_MUTE] = is_mute
         for monitor, window in self.windows.items():
-            if monitor.is_primary():
+            if is_primary_monitor(monitor):
                 window.set_mute(is_mute)
 
     @property
@@ -581,7 +615,7 @@ class VideoPlayer(BasePlayer):
     def monitor_sync(self):
         primary_monitor = None
         for monitor, _window in self.windows.items():
-            if monitor.is_primary:
+            if is_primary_monitor(monitor):
                 primary_monitor = monitor
                 break
         if primary_monitor:
