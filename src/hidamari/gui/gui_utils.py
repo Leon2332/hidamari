@@ -14,6 +14,10 @@ from hidamari.utils import is_flatpak
 
 logger = logging.getLogger(LOGGER_NAME)
 
+# Preview size for video cards (CSS pixels). Matches a 16:9 card thumbnail.
+THUMBNAIL_WIDTH = 256
+THUMBNAIL_HEIGHT = 144
+
 
 def _generate_thumbnail_flatpak(filename):
     # Inside Flatpak, DesktopThumbnailFactory runs the thumbnailer via
@@ -60,10 +64,8 @@ def generate_thumbnail(filename):
     return factory.lookup(uri, mtime)
 
 
-def get_thumbnail(video_path, list_store, idx):
-    # Best-effort: a preview thumbnail must never crash the GUI. On failure the
-    # generic video icon set by the caller stays in place. (In the Flatpak the
-    # sandboxed thumbnailer can fail; that's fine, we just skip the preview.)
+def load_thumbnail_pixbuf(video_path, width=THUMBNAIL_WIDTH, height=THUMBNAIL_HEIGHT):
+    """Load a video thumbnail scaled to fit inside width×height (letterboxed)."""
     try:
         info = Gio.File.new_for_path(video_path).query_info(
             "thumbnail::path", Gio.FileQueryInfoFlags.NONE, None
@@ -71,10 +73,33 @@ def get_thumbnail(video_path, list_store, idx):
         thumbnail = info.get_attribute_byte_string("thumbnail::path") or generate_thumbnail(
             video_path
         )
-        if thumbnail:
-            list_store[idx][0] = GdkPixbuf.Pixbuf.new_from_file_at_size(thumbnail, -1, 96)
+        if not thumbnail:
+            return None
+        return GdkPixbuf.Pixbuf.new_from_file_at_size(thumbnail, width, height)
     except (GLib.Error, OSError, subprocess.SubprocessError) as e:
         logger.debug("[Thumbnail] Skipped %s: %s", os.path.basename(video_path), e)
+        return None
+
+
+def apply_thumbnail_async(video_path, picture: "Gtk.Picture", width=THUMBNAIL_WIDTH, height=THUMBNAIL_HEIGHT):
+    """Generate/load a thumbnail off-thread and set it on a Gtk.Picture."""
+
+    def worker():
+        pixbuf = load_thumbnail_pixbuf(video_path, width, height)
+        if pixbuf is None:
+            return
+
+        def _apply():
+            try:
+                picture.set_pixbuf(pixbuf)
+            except GLib.Error as e:
+                logger.debug("[Thumbnail] set_pixbuf failed: %s", e)
+            return False
+
+        GLib.idle_add(_apply)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
 
 def debounce(wait_time):
