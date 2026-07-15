@@ -68,7 +68,9 @@ CONFIG_KEY_FIRST_TIME = "is_first_time"
 CONFIG_TEMPLATE = {
     CONFIG_KEY_VERSION: CONFIG_VERSION,
     CONFIG_KEY_MODE: MODE_NULL,
-    CONFIG_KEY_DATA_SOURCE: None,
+    # Populated lazily via refresh_config_template_monitors() so importing
+    # commons does not force a Gdk/GTK version (systray stays on GTK3).
+    CONFIG_KEY_DATA_SOURCE: {"Default": ""},
     CONFIG_KEY_MUTE: False,
     CONFIG_KEY_VOLUME: 50,
     CONFIG_KEY_STATIC_WALLPAPER: True,
@@ -81,14 +83,21 @@ CONFIG_TEMPLATE = {
     CONFIG_KEY_FIRST_TIME: True,
 }
 
-from hidamari.monitor import MonitorInfo
 
-# initialize config according to monitors
-info = MonitorInfo()
-monitors = info.monitors()
-data_sources = {}
-for monitor in monitors:
-    data_sources[monitor["name"]] = ""
-data_sources["Default"] = ""
+def refresh_config_template_monitors():
+    """Fill CONFIG_TEMPLATE data_source keys from the current monitor layout.
 
-CONFIG_TEMPLATE[CONFIG_KEY_DATA_SOURCE] = data_sources
+    Safe to call repeatedly. Requires Gdk 4 (GUI/player processes only).
+    """
+    try:
+        from hidamari.monitor import MonitorInfo
+    except Exception:
+        CONFIG_TEMPLATE[CONFIG_KEY_DATA_SOURCE] = {"Default": ""}
+        return CONFIG_TEMPLATE[CONFIG_KEY_DATA_SOURCE]
+
+    data_sources = {}
+    for monitor in MonitorInfo.monitors():
+        data_sources[monitor["name"]] = ""
+    data_sources["Default"] = ""
+    CONFIG_TEMPLATE[CONFIG_KEY_DATA_SOURCE] = data_sources
+    return data_sources
